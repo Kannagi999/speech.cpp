@@ -35,6 +35,13 @@ speech serve parakeet-tdt-0.6b-v3                                  # POST /v1/au
   checked against the model's languages.
 - With `timestamps`, the result also has the tokens and segments with their times in seconds. A segment ends at a full
   stop, a question mark or an exclamation mark.
+- On a GPU, the encoder runs on the GPU, and the decoding runs on the CPU where the file's decoding weights are
+  quantized (Q8_0, Q6_K, Q5_K and Q4_K files) and on the GPU where they are F16 or F32: each step of the decoding is a
+  small computation, which the CPU finishes before a round trip to the GPU would with quantized weights but not with
+  F16 ones. `decode_on_cpu` chooses either way per request. The model keeps a copy of the weights the decoding reads in
+  the CPU's memory for it, 12 MB for the Q8_0 files of reazonspeech-v2 and parakeet-ja and 35 MB for the F16 file of
+  parakeet-v3, and the CPU computes with `--threads`. The CPU's arithmetic differs from the GPU's, so a long recording
+  can come out a word different where two words score almost the same.
 
 Not supported: the CTC head of parakeet-tdt_ctc-0.6b-ja, which NeMo does not decode with by default.
 
@@ -45,6 +52,7 @@ Not supported: the CTC head of parakeet-tdt_ctc-0.6b-ja, which NeMo does not dec
 | `language` | `auto` | one of the model's languages; only checked |
 | `timestamps` | false | add the times of the tokens and segments |
 | `decoding` | `beam` | reazonspeech-v2 only: `beam` or `greedy`. Greedy is faster and can write another text, often with fewer commas and full stops |
+| `decode_on_cpu` | true for Q8_0 and K-quant files, false for F16 and F32 | for a model on a GPU, decode on the CPU (true) or on the GPU (false). A model on the CPU decodes there either way |
 
 ## Accuracy
 
@@ -56,7 +64,9 @@ Every stage is checked against NeMo's tensors on utterances of FLEURS' test spli
 | parakeet-tdt-0.6b-v3 | 12 utterances of en_us, de_de, fr_fr and es_419, 6 to 23 s | NeMo's text on all twelve |
 | reazonspeech-nemo-v2 | 8 ja_jp utterances and 2 joined inputs of 65 s and 311 s | NeMo's text on all ten, with beam search and with greedy decoding |
 
-The times of tokens and segments are NeMo's exactly.
+The times of tokens and segments are NeMo's exactly with F32 weights, and with F16 weights decoding on Metal. Decoding on
+the CPU with F16 weights, a token can fall one frame (80 ms) from NeMo's where two frames score almost the same: one
+token in 2 of reazonspeech-nemo-v2's 20 decodings.
 
 On the 4,483 utterances of Common Voice 8.0's Japanese test set, trimmed to the voice, the CER in F16 is 7.88% for
 parakeet-tdt_ctc-0.6b-ja, 12.03% for reazonspeech-nemo-v2 with beam search and 12.49% with greedy decoding (2.98%,
