@@ -29,6 +29,7 @@ Not supported: timestamps, which need a second model, Qwen3-ForcedAligner-0.6B; 
 |---|---|---|
 | `language` | `auto` | one of the 30 languages, which then steers the model, or `auto`, which lets it find the language |
 | `prompt` | `""` | what the model is told of the audio before it hears it: the names and terms it may hold. The model uses it as background, not as instructions to follow |
+| `draft` | `""` | the text the recognition is likely to write, such as an earlier recognition of the beginning of the same audio. The model checks several of its tokens at once and keeps those it would write, so the text is the same, sooner where the draft is right; where two tokens score almost the same, it can choose the other. Live transcription gives each reading the reading before |
 
 The languages are `ar` `cs` `da` `de` `el` `en` `es` `fa` `fi` `fil` `fr` `hi` `hu` `id` `it` `ja` `ko` `mk` `ms` `nl`
 `pl` `pt` `ro` `ru` `sv` `th` `tr` `vi` `yue` `zh`, and 22 Chinese dialects under `zh` or `auto`.
@@ -101,6 +102,13 @@ days: on the M5, speech.cpp's p50 latencies are 4% to 6% lower and llama.cpp's p
 speech.cpp's latencies are 10% to 31% lower. llama.cpp's peak memory on the M5 is 6.07 GB with the 0.6B model and
 7.59 GB with the 1.7B, against speech.cpp's 1.01 GB and 2.35 GB, and its VRAM on the RTX 2080 1.95 GB and 3.32 GB,
 against 1.13 GB and 2.47 GB. Its CER is 0.1 and 0.5 points lower.
+
+Live transcription (`speech serve`'s `/v1/realtime` with `server_vad`, `speech asr --live`) gives each reading the
+one before as its draft. On 2026-10-15, FLEURS's Japanese and English test clips, Q8_0: the p50 of the time from the
+end of speech to the completed transcript is 0.81 s with the 0.6B model and 0.97 to 0.99 s with the 1.7B on the M5, and
+0.76 to 0.78 s and 0.80 to 0.81 s on the RTX 2080, of which about 0.7 s is the detection's wait for the end of speech.
+On the RTX 2080, 2 of 58 completed transcripts differed from the same audio recognized without a draft, at a near tie
+(a full stop at the end, タイマー for タイマ).
 
 On the M5 on 2026-10-07, 1338 s of audio took 120 s with the 0.6B model, nearly all of it the first part's 4096 tokens,
 with a peak memory of 2.03 GB.
