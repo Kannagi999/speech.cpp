@@ -26,12 +26,19 @@ struct Synthesizer::Chunk {
     bool ended = false, stopped = false;
 };
 
-Synthesizer::Synthesizer(const ModelFile & m, ggml_backend_t backend)
-    : m_(m), prompt_(m), text_(m, backend), decoder_(m, backend), codec_(m, backend) {
+Synthesizer::Synthesizer(const ModelFile & m, ggml_backend_t backend, ggml_backend_t cpu)
+    : m_(m), prompt_(m), text_(m, backend, 0, -1, cpu), decoder_(m, backend), codec_(m, backend) {
     chunk_bytes_ = m.size("drama3.generation.chunk_bytes");
     chunk_speakers_ = m.size("drama3.generation.chunk_speakers");
     recent_turns_ = m.u32("drama3.generation.recent_turns");
     eos_ = (int32_t) m.u32("drama3.eos_token_id");
+    // The memory of a chunk's longest prompt and speech, taken as the model loads, so that no model loaded after it
+    // leaves a request short of it.
+    const int64_t prompt_rows = m.size("drama3.generation.max_prompt_rows");
+    const int64_t rows = prompt_rows + m.size("drama3.generation.max_frames");
+    text_.reserve(rows, prompt_rows);
+    decoder_.reserve(rows, prompt_rows);
+    codec_.reserve_decoding(window_frames(5));
 }
 
 Synthesizer::Chunk Synthesizer::speak(const std::vector<int32_t> & rows, const Request & r, const FrameSampler & sampler, std::mt19937_64 & rng,

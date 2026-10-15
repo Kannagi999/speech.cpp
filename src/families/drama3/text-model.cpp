@@ -55,7 +55,7 @@ struct TextModel::States {
     States & operator=(const States &) = delete;
 };
 
-TextModel::TextModel(const ModelFile & m, ggml_backend_t backend, int first, int last) : backend_(backend), m_(m) {
+TextModel::TextModel(const ModelFile & m, ggml_backend_t backend, int first, int last, ggml_backend_t cpu) : backend_(backend), m_(m) {
     const std::string x = "drama3.text.", a = "drama3.audio_decoder.";
     for (const std::string & type : m.str_array(x + "layer_types")) types_.push_back(type == "full_attention");
     first_ = first;
@@ -87,9 +87,17 @@ TextModel::TextModel(const ModelFile & m, ggml_backend_t backend, int first, int
     const int64_t channels = 2 * (int64_t) key_heads_ * key_dim_ + (int64_t) value_heads_ * value_dim_;
     states_ = std::make_unique<States>(backend_, delta_layers, key_dim_, value_dim_, value_heads_, conv_width_, channels);
     allocr_ = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend_));
+    if (cpu) {
+        ggml_backend_t backends[] = {backend_, cpu};
+        // Without offloading the prompt's experts to the GPU: copying a layer's experts over for a prompt of 46 rows
+        // made it take 2.5 s where the CPU took 1.0 s, on an RTX 2080 with Vulkan and an i9-9900K (2026-10-15).
+        sched_ = ggml_backend_sched_new(backends, nullptr, 2, 32768, false, false);
+        if (!sched_) throw Error(Fault::OutOfMemory, "cannot create the scheduler of the text model's graphs");
+    }
 }
 
 TextModel::~TextModel() {
+    if (sched_) ggml_backend_sched_free(sched_);
     if (allocr_) ggml_gallocr_free(allocr_);
 }
 
@@ -194,6 +202,14 @@ ggml_tensor * TextModel::experts(Graph & g, int l, ggml_tensor * x, ggml_tensor 
 }
 
 std::vector<float> TextModel::embed(const std::vector<int32_t> & frames, int64_t n) {
+    Graph g;
+    ggml_tensor * e = build_embed(g, frames, n);
+    g.output(e);
+    g.compute(backend_, allocr_);
+    return Graph::read(e);
+}
+
+ggml_tensor * TextModel::build_embed(Graph & g, const std::vector<int32_t> & frames, int64_t n) {
     const int width = 1 + codebooks_;
     if (n < 1 || (int64_t) frames.size() != n * width) throw std::invalid_argument("the text model embeds whole frames");
     ggml_tensor * table = m_.tensor("token_embd");
@@ -214,7 +230,6 @@ std::vector<float> TextModel::embed(const std::vector<int32_t> & frames, int64_t
             seen.push_back((b - 1) * codes_ + code);
         }
     }
-    Graph g;
     ggml_context * c = g.ctx();
     ggml_tensor * e = ggml_get_rows(c, table, g.input(ids, n));
     if (seen_ > 0) {
@@ -224,9 +239,7 @@ std::vector<float> TextModel::embed(const std::vector<int32_t> & frames, int64_t
         mixed = ggml_scale(c, mixed, 1.0f / std::sqrt((float) (1 + seen_)));
         e = ggml_add(c, ggml_mul(c, e, g.input(text, 1, n)), ggml_mul(c, mixed, g.input(audio, 1, n)));
     }
-    g.output(e);
-    g.compute(backend_, allocr_);
-    return Graph::read(e);
+    return e;
 }
 
 std::vector<float> TextModel::run(const std::vector<float> & input, int64_t n, TextModelStages * stages) {
@@ -241,29 +254,11 @@ std::vector<float> TextModel::run(const std::vector<float> & input, int64_t n, T
     for (int64_t from = 0; from < n; from += kBlockRows) {
         const int64_t rows = std::min(kBlockRows, n - from);
         Graph g;
-        ggml_context * c = g.ctx();
-        ggml_tensor * x = g.input(std::vector<float>(input.begin() + from * h_, input.begin() + (from + rows) * h_), h_, rows);
-        // A graph holds only the inputs its nodes read, and only attention reads the positions and the mask.
-        const bool attends = std::count(types_.begin() + first_, types_.begin() + last_, true) > 0;
-        ggml_tensor * pos = attends ? positions(g, n_past_, rows) : nullptr;
-        ggml_tensor * mask = attends ? causal_mask(g, n_past_, rows) : nullptr;
         std::vector<std::vector<ggml_tensor *>> kept((size_t) count);
-        for (int l = first_; l < last_; l++) {
-            const std::string p = layer_name(l);
-            ggml_tensor * h = ggml_mul(c, ggml_rms_norm(c, x, eps_), m_.tensor(p + "attn_norm"));
-            ggml_tensor * mixer = attention(l) ? attention_mixer(g, l, h, n_past_, pos, mask) : delta_mixer(g, l, h);
-            x = ggml_add(c, x, mixer);
-            ggml_tensor * router = nullptr;
-            ggml_tensor * moe = experts(g, l, ggml_mul(c, ggml_rms_norm(c, x, eps_), m_.tensor(p + "post_attn_norm")), &router);
-            x = ggml_add(c, x, moe);
-            if (stages) {
-                for (ggml_tensor * t : {mixer, router, moe, x}) g.output(t);
-                kept[(size_t) (l - first_)] = {mixer, router, moe, x};
-            }
-        }
-        if (last_ == layers()) x = ggml_mul(c, ggml_rms_norm(c, x, eps_), m_.tensor("output_norm"));
-        g.output(x);
-        g.compute(backend_, allocr_);
+        ggml_tensor * x = build_rows(g, g.input(std::vector<float>(input.begin() + from * h_, input.begin() + (from + rows) * h_), h_, rows),
+                                     stages ? &kept : nullptr);
+        if (sched_) g.compute(sched_);
+        else g.compute(backend_, allocr_);
         if (stages) {
             for (int i = 0; i < count; i++) {
                 std::vector<float> * where[] = {&stages->mixer[(size_t) i], &stages->router[(size_t) i], &stages->moe[(size_t) i],
@@ -279,6 +274,50 @@ std::vector<float> TextModel::run(const std::vector<float> & input, int64_t n, T
         n_past_ += rows;
     }
     return out;
+}
+
+ggml_tensor * TextModel::build_rows(Graph & g, ggml_tensor * x, std::vector<std::vector<ggml_tensor *>> * kept) {
+    ggml_context * c = g.ctx();
+    const int64_t rows = x->ne[1];
+    // A graph holds only the inputs its nodes read, and only attention reads the positions and the mask.
+    const bool attends = std::count(types_.begin() + first_, types_.begin() + last_, true) > 0;
+    ggml_tensor * pos = attends ? positions(g, n_past_, rows) : nullptr;
+    ggml_tensor * mask = attends ? causal_mask(g, n_past_, rows) : nullptr;
+    for (int l = first_; l < last_; l++) {
+        const std::string p = layer_name(l);
+        ggml_tensor * h = ggml_mul(c, ggml_rms_norm(c, x, eps_), m_.tensor(p + "attn_norm"));
+        ggml_tensor * mixer = attention(l) ? attention_mixer(g, l, h, n_past_, pos, mask) : delta_mixer(g, l, h);
+        x = ggml_add(c, x, mixer);
+        ggml_tensor * router = nullptr;
+        ggml_tensor * moe = experts(g, l, ggml_mul(c, ggml_rms_norm(c, x, eps_), m_.tensor(p + "post_attn_norm")), &router);
+        x = ggml_add(c, x, moe);
+        if (kept) {
+            for (ggml_tensor * t : {mixer, router, moe, x}) g.output(t);
+            (*kept)[(size_t) (l - first_)] = {mixer, router, moe, x};
+        }
+    }
+    if (last_ == layers()) x = ggml_mul(c, ggml_rms_norm(c, x, eps_), m_.tensor("output_norm"));
+    g.output(x);
+    return x;
+}
+
+void TextModel::reserve(int64_t rows, int64_t prompt_rows) {
+    if (prompt_rows < 1 || prompt_rows > rows) throw std::invalid_argument("the text model reserves for a prompt within its sequence");
+    start(rows);
+    // The largest graphs of such a sequence: the embeddings of the longest prompt, and a block of its rows that attends
+    // to every row before it.
+    std::vector<int32_t> frames((size_t) (prompt_rows * (1 + codebooks_)), 0);
+    Graph embedding;
+    embedding.output(build_embed(embedding, frames, prompt_rows));
+    const int64_t block = std::min(kBlockRows, prompt_rows);
+    n_past_ = prompt_rows - block;
+    Graph rows_graph;
+    build_rows(rows_graph, rows_graph.zeros(h_, block), nullptr);
+    // The embeddings compute on the model's device alone, and the layers through the scheduler where it has one.
+    const bool reserved = ggml_gallocr_reserve(allocr_, embedding.cgraph()) &&
+                          (sched_ ? ggml_backend_sched_reserve(sched_, rows_graph.cgraph()) : ggml_gallocr_reserve(allocr_, rows_graph.cgraph()));
+    if (!reserved) throw Error(Fault::OutOfMemory, "cannot reserve the memory of the text model's graphs on " + std::string(ggml_backend_name(backend_)));
+    start(rows);
 }
 
 std::vector<float> TextModel::logits(const std::vector<float> & hidden) {
