@@ -1,12 +1,10 @@
-#include "frontend.h"
+#include "nemo-frontend.h"
 
 #include <cmath>
 #include <complex>
-#include <stdexcept>
 #include <string>
 
 #include "error.h"
-namespace fastconformer {
 
 namespace {
 
@@ -20,15 +18,16 @@ std::vector<double> read_tensor(const ModelFile & m, const std::string & name) {
 
 }  // namespace
 
-Frontend::Frontend(const ModelFile & m)
+NemoFrontend::NemoFrontend(const ModelFile & m, const std::string & prefix, bool per_feature)
     : sample_rate_((int) m.u32("speech.sample_rate")),
-      n_fft_((int) m.u32("fastconformer.frontend.n_fft")),
-      hop_((int) m.u32("fastconformer.frontend.hop_length")),
-      mels_((int) m.u32("fastconformer.frontend.n_mels")),
-      preemphasis_(m.f32("fastconformer.frontend.preemphasis")),
-      log_guard_(m.f32("fastconformer.frontend.log_guard")),
-      std_guard_(m.f32("fastconformer.frontend.std_guard")),
+      n_fft_((int) m.u32(prefix + "frontend.n_fft")),
+      hop_((int) m.u32(prefix + "frontend.hop_length")),
+      mels_((int) m.u32(prefix + "frontend.n_mels")),
+      per_feature_(per_feature),
+      preemphasis_(m.f32(prefix + "frontend.preemphasis")),
+      log_guard_(m.f32(prefix + "frontend.log_guard")),
       fft_(n_fft_) {
+    if (per_feature) std_guard_ = m.f32(prefix + "frontend.std_guard");
     const std::vector<double> w = read_tensor(m, "frontend.window");
     const int64_t window = (int64_t) w.size();
     window_.assign(n_fft_, 0.0);
@@ -45,48 +44,59 @@ Frontend::Frontend(const ModelFile & m)
     }
 }
 
-int64_t Frontend::frames(size_t samples) const {
+int64_t NemoFrontend::frames(size_t samples) const {
     // FilterbankFeatures.get_seq_len(): the STFT gives one frame more, which the official code masks out.
     return (int64_t) samples / hop_;
 }
 
-std::vector<float> Frontend::features(const std::vector<float> & samples) const {
-    const int64_t frames = this->frames(samples.size());
-    // normalize_batch() divides by frames - 1.
-    if (frames < 2) {
-        throw Error(Fault::OutOfRange, "the audio has " + std::to_string(samples.size()) + " samples at " + std::to_string(sample_rate_) +
-                                           " Hz; recognition needs at least " + std::to_string(2 * hop_),
-                    "audio");
+void NemoFrontend::preemphasize(const float * samples, size_t n, bool first, float previous, float * out) const {
+    for (size_t i = 0; i < n; i++) {
+        const float before = i > 0 ? samples[i - 1] : previous;
+        out[i] = i == 0 && first ? samples[0] : samples[i] - preemphasis_ * before;
     }
-    // Pre-emphasis in float32, as FilterbankFeatures.forward() computes it.
-    std::vector<float> x(samples.size());
-    x[0] = samples[0];
-    for (size_t i = 1; i < samples.size(); i++) x[i] = samples[i] - preemphasis_ * samples[i - 1];
+}
 
+void NemoFrontend::log_mel(const float * x, int64_t begin, int64_t total, int64_t frame, int64_t count, double * out) const {
     const int bins = n_fft_ / 2 + 1;
-    const int64_t n = (int64_t) x.size();
-    std::vector<double> mel((size_t) (frames * mels_));
-    std::vector<double> frame(n_fft_);
+    std::vector<double> windowed(n_fft_);
     std::vector<std::complex<double>> spectrum(bins);
     std::vector<double> power(bins);
-    for (int64_t f = 0; f < frames; f++) {
+    for (int64_t f = 0; f < count; f++) {
         // center=True with pad_mode="constant": the signal has n_fft / 2 zeros before it.
-        const int64_t start = f * hop_ - n_fft_ / 2;
+        const int64_t start = (frame + f) * hop_ - n_fft_ / 2;
         for (int k = 0; k < n_fft_; k++) {
             const int64_t i = start + k;
-            frame[k] = i >= 0 && i < n ? x[i] * window_[k] : 0.0;
+            windowed[k] = i >= 0 && i < total ? x[i - begin] * window_[k] : 0.0;
         }
-        fft_.transform(frame.data(), spectrum.data());
+        fft_.transform(windowed.data(), spectrum.data());
         for (int k = 0; k < bins; k++) power[k] = std::norm(spectrum[k]);
         for (int m = 0; m < mels_; m++) {
             double sum = 0;
             for (int k = bands_[m].first; k < bands_[m].second; k++) sum += filterbank_[(size_t) m * bins + k] * power[k];
-            mel[(size_t) (f * mels_ + m)] = std::log(sum + (double) log_guard_);
+            out[(size_t) (f * mels_ + m)] = std::log(sum + (double) log_guard_);
         }
+    }
+}
+
+std::vector<float> NemoFrontend::features(const std::vector<float> & samples) const {
+    const int64_t frames = this->frames(samples.size());
+    // normalize_batch() divides by frames - 1.
+    if (frames < (per_feature_ ? 2 : 1)) {
+        throw Error(Fault::OutOfRange, "the audio has " + std::to_string(samples.size()) + " samples at " + std::to_string(sample_rate_) +
+                                           " Hz; the model needs at least " + std::to_string((per_feature_ ? 2 : 1) * hop_),
+                    "audio");
+    }
+    std::vector<float> x(samples.size());
+    preemphasize(samples.data(), samples.size(), true, 0.0f, x.data());
+    std::vector<double> mel((size_t) (frames * mels_));
+    log_mel(x.data(), 0, (int64_t) x.size(), 0, frames, mel.data());
+    std::vector<float> out(mel.size());
+    if (!per_feature_) {
+        for (size_t i = 0; i < mel.size(); i++) out[i] = (float) mel[i];
+        return out;
     }
 
     // normalize_batch(normalize_type="per_feature"): the unbiased standard deviation, plus a guard.
-    std::vector<float> out(mel.size());
     for (int m = 0; m < mels_; m++) {
         double mean = 0;
         for (int64_t f = 0; f < frames; f++) mean += mel[(size_t) (f * mels_ + m)];
@@ -103,5 +113,3 @@ std::vector<float> Frontend::features(const std::vector<float> & samples) const 
     }
     return out;
 }
-
-}  // namespace fastconformer

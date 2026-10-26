@@ -22,6 +22,7 @@ first time.
 | [`parakeet-tdt_ctc-0.6b-ja`](https://huggingface.co/sakasegawa/parakeet-tdt_ctc-0.6b-ja-GGUF) | recognition | ja | `parakeet-tdt_ctc-0.6B-ja-Q8_0.gguf`, 0.66 GB | [FastConformer](models/fastconformer.md) |
 | [`parakeet-tdt-0.6b-v3`](https://huggingface.co/sakasegawa/parakeet-tdt-0.6b-v3-GGUF) | recognition | 25 European languages | `parakeet-tdt-0.6B-v3-F16.gguf`, 1.26 GB | [FastConformer](models/fastconformer.md) |
 | [`silero-vad`](https://huggingface.co/sakasegawa/silero-vad-GGUF) | detection | any | `silero-vad-309K-v6.2-F32.gguf`, 1.2 MB | [Silero VAD](models/silero-vad.md) |
+| [`nemotron-3-diarization`](https://huggingface.co/sakasegawa/Nemotron-3-Diarization-GGUF) | diarization | any | `Nemotron-3-Diarization-99M-Q8_0.gguf`, 106 MB | [Sortformer](models/sortformer.md) |
 
 `speech models` prints the same, with what is fetched. Each family's page links the upstream models.
 
@@ -41,7 +42,7 @@ A detection model takes no language, and `speech vad` without a model lists ever
 
 ## Names
 
-Every subcommand that takes a model (`tts`, `asr`, `vad`, `voice`, `info`, `serve`, `worker`) takes a model file's path,
+Every subcommand that takes a model (`tts`, `asr`, `vad`, `diarize`, `voice`, `info`, `serve`, `worker`) takes a model file's path,
 which ends in `.gguf`, or `NAME[:TYPE]`:
 
 - NAME is a name of the catalog, or the Hugging Face repository of its converted files.
