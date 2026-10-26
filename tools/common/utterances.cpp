@@ -101,6 +101,7 @@ Assembly::~Assembly() {
         std::lock_guard<std::mutex> lock(mutex_);
         closing_ = true;
         finals_.clear();
+        waiting_.clear();
         if (reading_) reading_->cancel();
         if (final_) final_->cancel();
     }
@@ -142,6 +143,22 @@ void Assembly::manual() {
     changed_.notify_all();
 }
 
+void Assembly::diarize(std::unique_ptr<Diarization> diarization) {
+    Diarized ending;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        ending = diarized_;
+    }
+    // The utterances that wait for the diarization under way complete with what it gives at its end, which settles
+    // all of its audio, and then gives every number it will.
+    if (ending.diarization) ending.diarization->end();
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (ending.diarization) next_speaker_ = ending.first_speaker + ending.diarization->numbers_used();
+    diarized_ = diarization ? Diarized{std::move(diarization), heard_, next_speaker_} : Diarized{};
+    release();
+    changed_.notify_all();
+}
+
 void Assembly::push(const float * samples, size_t n) {
     if (n == 0) return;
     if (detection_) {
@@ -149,16 +166,26 @@ void Assembly::push(const float * samples, size_t n) {
         detection_->push(samples, n);
         detecting_ += seconds_since(t0);
     }
-    std::lock_guard<std::mutex> lock(mutex_);
-    audio_.insert(audio_.end(), samples, samples + n);
-    heard_ += n;
-    if (detection_) {
-        pushed_ += n;
-        take_regions();
-    } else if (manual_) {
-        begin_manual_utterance();
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        audio_.insert(audio_.end(), samples, samples + n);
+        heard_ += n;
+        if (detection_) {
+            pushed_ += n;
+            take_regions();
+        } else if (manual_) {
+            begin_manual_utterance();
+        }
+        changed_.notify_all();
     }
-    changed_.notify_all();
+    // The diarization computes on its model outside the assembly's lock, under which the worker waits for it, and after
+    // the audio is taken, so that a diarization that fails loses no audio of the transcription.
+    if (diarized_.diarization) {
+        diarized_.diarization->push(samples, n);
+        std::lock_guard<std::mutex> lock(mutex_);
+        release();
+        changed_.notify_all();
+    }
 }
 
 bool Assembly::commit() {
@@ -189,8 +216,15 @@ void Assembly::clear() {
 void Assembly::end() {
     std::unique_lock<std::mutex> lock(mutex_);
     end_detection();
+    // The diarization's end settles every utterance it has not, whose completions wait for it.
+    if (const std::shared_ptr<Diarization> diarization = diarized_.diarization) {
+        lock.unlock();
+        diarization->end();
+        lock.lock();
+        release();
+    }
     changed_.notify_all();
-    changed_.wait(lock, [&] { return finals_.empty() && !busy_; });
+    changed_.wait(lock, [&] { return finals_.empty() && !busy_ && waiting_.empty(); });
 }
 
 size_t Assembly::held() const {
@@ -269,6 +303,9 @@ void Assembly::commit_samples(uint64_t number, uint64_t first, uint64_t last) {
     if (asked_) {
         Final f;
         f.number = number;
+        f.first = first;
+        f.last = last;
+        f.diarized = diarized_;
         if (current_ && current_->number == number) {
             f.sent = current_->sent;
             f.draft = current_->last_reading;
@@ -332,6 +369,28 @@ void Assembly::send(const Event & e) {
     if (!closing_) emit_(e);
 }
 
+void Assembly::release() {
+    while (!waiting_.empty()) {
+        Waiting & w = waiting_.front();
+        // Each push of the diarization comes back here, and so does its end, which settles all of its audio, before
+        // another takes its place.
+        if (const Diarization * diarization = w.diarized.diarization.get()) {
+            const double from = (double) w.diarized.from / rate_;
+            const double start = (double) w.first / rate_ - from, end = (double) w.last / rate_ - from;
+            if (!diarization->covers(end)) return;
+            std::vector<SpeakerSegment> within = diarization->within(std::max(start, 0.0), end);
+            for (SpeakerSegment & s : within) {
+                s.start += from;
+                s.end += from;
+                s.speaker += w.diarized.first_speaker;
+            }
+            w.event.speakers = std::move(within);
+        }
+        send(w.event);
+        waiting_.pop_front();
+    }
+}
+
 void Assembly::work() {
     std::unique_lock<std::mutex> lock(mutex_);
     for (;;) {
@@ -374,7 +433,13 @@ void Assembly::work() {
                 rest.delta = e.transcript.text.substr(f.sent.size());
                 send(rest);
             }
-            if (e.kind == Event::Kind::Completed || e.kind == Event::Kind::Failed) send(e);
+            if (e.kind == Event::Kind::Completed || e.kind == Event::Kind::Failed) {
+                // The completion waits for its speakers in a queue of its own, so that the recognitions after it, which
+                // hold their places among the model's requests, go on meanwhile.
+                Diarized diarized = e.kind == Event::Kind::Completed ? f.diarized : Diarized{};
+                waiting_.push_back({std::move(e), std::move(diarized), f.first, f.last});
+                release();
+            }
             changed_.notify_all();
             continue;
         }

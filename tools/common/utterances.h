@@ -15,6 +15,7 @@
 #include "cancellation.h"
 #include "library.h"
 #include "request-options.h"
+#include "speakers.h"
 #include "transcript.h"
 
 // Utterance assembly: audio that arrives a piece at a time, at a rate given when the assembly starts, cut into
@@ -23,8 +24,10 @@
 // them for the whole audio; without one, the caller commits each utterance, all the audio appended since the last
 // commit. While an utterance goes on, its beginning is read again and again, and the beginning that two readings in a
 // row agree on goes out as deltas, which only ever add text; once it is committed, it is recognized whole, and that
-// recognition, which may differ from the deltas, completes it. The events go out in order: an utterance's speech started,
-// its deltas, its speech stopped and its commit, then its completion, with the next utterance's events begun meanwhile.
+// recognition, which may differ from the deltas, completes it. With a diarization, the completion waits until the
+// diarization has settled the utterance's audio, and carries the speakers within it, while the recognitions after it go
+// on. The events go out in order: an utterance's speech started, its deltas, its speech stopped and its commit, then its
+// completion, with the next utterance's events begun meanwhile, and the completions in the order of the utterances.
 
 namespace utterances {
 
@@ -49,6 +52,11 @@ struct Event {
     /** Completed: the recognition of the whole utterance, and the utterance's length in seconds. */
     Transcript transcript;
     double duration = 0;
+    /**
+     * Completed, with a diarization: the speakers within the utterance, in seconds from the start of the audio, as
+     * speakers_within() gives them, numbered in the assembly (diarize()); none without a diarization.
+     */
+    std::optional<std::vector<SpeakerSegment>> speakers;
     /** Failed: what the recognizer threw. */
     std::exception_ptr failure;
 };
@@ -148,6 +156,17 @@ public:
     void detect(std::unique_ptr<Detection> detection);
     /** Leaves the commits to the caller from now on, ending a detection under way as detect() does. */
     void manual();
+    /**
+     * Diarizes the audio that follows with `diarization`, of the assembly's rate, whose times start at the audio taken so
+     * far, so that each utterance committed from now on carries its speakers; or none when it is null. A diarization
+     * under way is ended first, and the utterances committed while it went on complete with the speakers it gave. Each
+     * diarization numbers its speakers from 0, and the assembly numbers them after every number the diarizations before
+     * it gave, so that no number names two speakers whom two diarizations found: the one before could not tell whether
+     * a speaker of the next is one it heard.
+     */
+    void diarize(std::unique_ptr<Diarization> diarization);
+    /** The diarization under way, or nullptr. */
+    const Diarization * diarization() const { return diarized_.diarization.get(); }
     /** The detection under way, or nullptr. */
     const Detection * detection() const { return detection_.get(); }
 
@@ -192,8 +211,20 @@ private:
     };
 
     /** A committed utterance that waits for its recognition, with its place or what refused it one. */
+    /** A diarization as the utterances committed while it goes on read it. */
+    struct Diarized {
+        std::shared_ptr<Diarization> diarization;
+        /** The sample at which its audio began, and the assembly's number of its speaker 0. */
+        uint64_t from = 0;
+        int first_speaker = 0;
+    };
+
     struct Final {
         uint64_t number = 0;
+        /** Its first sample and the sample after its last, counted from the start of the audio. */
+        uint64_t first = 0, last = 0;
+        /** The diarization under way when it was committed, which gives its speakers. */
+        Diarized diarized;
         /** What its deltas gave while it was said, which the rest of its final text follows as one more delta. */
         std::string sent;
         /** The text of its last reading, which its recognition checks as a draft. */
@@ -207,6 +238,17 @@ private:
     };
 
     void work();
+    /**
+     * A completion or failure, which goes out once the speakers of its samples are settled, with them, and after those
+     * of the utterances before it.
+     */
+    struct Waiting {
+        Event event;
+        Diarized diarized;
+        uint64_t first = 0, last = 0;
+    };
+    /** Sends the completions that wait, from the first, while each one's speakers are settled. */
+    void release();
     // These run with the mutex held.
     void take_regions();
     void announce(Utterance & u);
@@ -227,6 +269,12 @@ private:
     /** The detection, used by the caller alone, and whether the caller commits while there is none. */
     std::unique_ptr<Detection> detection_;
     bool manual_ = true;
+    /**
+     * The diarization, which the caller pushes to and ends and each utterance committed while it goes on keeps, and the
+     * assembly's number of the next one's speaker 0.
+     */
+    Diarized diarized_;
+    int next_speaker_ = 0;
     double detecting_ = 0;
 
     mutable std::mutex mutex_;
@@ -243,6 +291,7 @@ private:
     uint64_t next_ = 0;
     std::optional<Utterance> current_;
     std::deque<Final> finals_;
+    std::deque<Waiting> waiting_;
     /** Whether the worker recognizes, an utterance or the beginning of one. */
     bool busy_ = false;
     std::shared_ptr<Cancellation> reading_, final_;
