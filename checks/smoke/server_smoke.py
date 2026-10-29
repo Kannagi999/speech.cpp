@@ -15,9 +15,12 @@ reference/qwen3-asr/dump.py, each other request a Qwen3-ASR dump holds with its 
 and each decoding other than the default that a FastConformer dump holds as the form field decoding, json without any
 member but the text, verbose_json of each request with the language qwen-asr parsed by its tag or without one
 (FastConformer, audio without speech), and where the model takes timestamps with its segments, the same with a segment
-granularity, and that granularity's refusal where it does not; WAV at three times the model's rate, and the errors of a
-file that is not WAV or cannot be read, a language, a prompt, a decoding, a member and a granularity it does not take,
-and audio the library cannot take.
+granularity, its words with the word granularity, both with both, and those granularities' refusal where it does not,
+or where the model cannot time its text the reason and no segments; for a Nemotron 3.5 Transcribe dump of the model
+card's prompt for speaker tags, diarized_json of the model's own speakers, labeled in the order they first speak, and
+its refusal of chunking_strategy; WAV at three times the model's rate, and the errors of a file that is not WAV or
+cannot be read, a language, a prompt, a decoding, a member and a granularity it does not take, and audio the library
+cannot take.
 
 For a synthesis model, also that a request option given to the server as a flag (--seed, and --tts.seed for the
 synthesis model alone) is the default of a request that does not set it, listed in /v1/models' defaults beside the
@@ -79,7 +82,39 @@ speech, model, *dumps = args
 added = [o.split("=", 1)[0] for i, o in enumerate(options) if i > 0 and options[i - 1] == "--add-voice"]
 load = [o for i, o in enumerate(options) if o in ("--device", "--threads") or (i and options[i - 1] in ("--device", "--threads"))]
 ORIGIN = "http://localhost:5173"
+SERVER_VAD = ([("chunking_strategy[type]", "server_vad"), ("chunking_strategy[threshold]", "0.6"),
+               ("chunking_strategy[prefix_padding_ms]", "200"), ("chunking_strategy[silence_duration_ms]", "700")],
+              ["--threshold", "0.6", "--speech-pad-ms", "200", "--min-silence-duration-ms", "700"])
 
+
+def wav_file(samples, at_rate):
+    pcm = array.array("h", [max(-32768, min(32767, round(x * 32768))) for x in samples]).tobytes()
+    return (b"RIFF" + struct.pack("<I", 36 + len(pcm)) + b"WAVEfmt " + struct.pack("<IHHIIHH", 16, 1, 1, at_rate, at_rate * 2, 2, 16)
+            + b"data" + struct.pack("<I", len(pcm)) + pcm)
+
+
+# The texts of a quantized file come from `speech asr`, which loads the model again: before the server holds it, so that
+# a model of half the GPU's memory needs only its own.
+dump_requests_of = {d: dump_requests(speech, model, d, options) for d in dumps}
+# So do the answers of `speech asr --vad` for the dumps' audio joined with a second of silence after each, which the
+# detection cuts into regions again, with its defaults and with the flags the members of server_vad map to.
+held = json.loads(subprocess.run([speech, "info", model, "--json"], stdout=subprocess.PIPE, check=True).stdout)
+if vad and held["task"] == "recognition":
+    joined = array.array("f", [x for d in dumps for x in list(read_npy(os.path.join(d, "audio.npy"))) + [0.0] * held["sample_rate"]])
+    long = wav_file(joined, held["sample_rate"])
+    timed = ["--timestamps"] if "timestamps" in {o["name"] for o in held["options"]} else []
+    with tempfile.TemporaryDirectory() as work:
+        path = os.path.join(work, "long.wav")
+        with open(path, "wb") as f:
+            f.write(long)
+
+        def vad_cli(*flags):
+            r = subprocess.run([speech, "asr", model, "--vad", vad, "--format", "json", *timed, *flags, *load, path],
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            assert r.returncode == 0, r.stderr.decode()[-600:]
+            return json.loads(r.stdout)
+
+        vad_answers = {(): vad_cli(), tuple(SERVER_VAD[1]): vad_cli(*SERVER_VAD[1])}
 
 
 def start_server():
@@ -323,24 +358,42 @@ elif info["task"] == "synthesis":
 else:
     expect_error(post_json("/v1/audio/speech", {"input": "あ。", "voice": "x"}), 404, None, None, "POST /v1/audio/speech to a recognition model")
 
-    def wav_file(samples, at_rate):
-        pcm = array.array("h", [max(-32768, min(32767, round(x * 32768))) for x in samples]).tobytes()
-        return (b"RIFF" + struct.pack("<I", 36 + len(pcm)) + b"WAVEfmt " + struct.pack("<IHHIIHH", 16, 1, 1, at_rate, at_rate * 2, 2, 16)
-                + b"data" + struct.pack("<I", len(pcm)) + pcm)
-
     takes = {o["name"] for o in info["options"]}
     first = None
     for d in dumps:
         name = os.path.basename(os.path.normpath(d))
         samples = read_npy(os.path.join(d, "audio.npy"))
         wav = wav_file(samples, rate)
-        requests = dump_requests(speech, model, d, options)
-        [(_, _, want, _)] = [r for r in requests if r[0] == "auto"]
-        if want and not first:
+        requests = dump_requests_of[d]
+        if [r[0] for r in requests] == ["speakers"]:
+            # A model that tells who speaks answers diarized_json itself, from one recognition of the whole file.
+            [(_, _, want, _)] = requests
+            status, _, body = transcribe([("response_format", "diarized_json")], [("file", name + ".wav", wav)])
+            diarized = json.loads(body)
+            segments = diarized["segments"]
+            assert status == 200 and diarized["text"] == want and diarized["task"] == "transcribe", (name, body)
+            if "untimed" in diarized:
+                assert segments == [], body
+            else:
+                labels = [s["speaker"] for s in segments if s["speaker"]]
+                first_seen = list(dict.fromkeys(labels))
+                assert "".join(s["text"] for s in segments) == want and first_seen == [chr(ord("A") + i) for i in range(len(first_seen))], body
+                assert all(s["type"] == "transcript.text.segment" and s["start"] <= s["end"] and
+                           s["speakers"] == ([{"speaker": s["speaker"], "start": s["start"], "end": s["end"]}] if s["speaker"] else [])
+                           for s in segments), body
+            expect_error(transcribe([("response_format", "diarized_json"), ("chunking_strategy", "auto")], [("file", name + ".wav", wav)]), 400,
+                         "invalid_value", "chunking_strategy", f"{name}: chunking_strategy with a model that tells who speaks")
+            print(f"{name}: diarized_json of the model's own speakers, {len(segments)} segments with "
+                  f"{len(set(s['speaker'] for s in segments))} labels joining into the expected text"
+                  + (f", no times: {diarized['untimed']}" if "untimed" in diarized else ""))
+            continue
+        # The request of the dump's own prompt, as a Nemotron 3.5 Transcribe dump of the contextual instruction holds it.
+        [(_, auto, want, _)] = [r for r in requests if r[0] == "auto"]
+        if want and not first and not auto:
             first = (wav, want, samples)
-        status, headers, body = transcribe([("model", info["name"])], [("file", name + ".wav", wav)])
+        status, headers, body = transcribe([("model", info["name"]), *auto.items()], [("file", name + ".wav", wav)])
         assert status == 200 and json.loads(body) == {"text": want} and headers["x-speech-stop"] == "complete", (name, body)
-        status, headers, body = transcribe([("response_format", "text")], [("file", name + ".wav", wav)])
+        status, headers, body = transcribe([("response_format", "text"), *auto.items()], [("file", name + ".wav", wav)])
         assert status == 200 and headers["content-type"].startswith("text/plain") and body.decode() == want, (name, body)
         # verbose_json carries the language the model heard, the tags joined with commas, and leaves it out where there is
         # none; it carries segments where the model gives times, whose granularity is OpenAI's default.
@@ -352,27 +405,47 @@ else:
             verbose = json.loads(body)
             want_members = {"task", "duration", "text"} | ({"language"} if want_languages else set())
             want_members |= {"segments"} if "timestamps" in takes else set()
+            want_members |= {"untimed"} if "untimed" in verbose else set()
             assert status == 200 and set(verbose) == want_members and verbose["task"] == "transcribe", (name, request, body)
             assert verbose["text"] == want_request and verbose.get("language") == (",".join(want_languages) or None), (name, request, body)
             assert abs(verbose["duration"] - len(samples) / rate) < 1e-9, verbose["duration"]
             if request == "auto":
                 plain_verbose = verbose
-        verbose_form = [("response_format", "verbose_json"), ("timestamp_granularities[]", "segment")]
+        verbose_form = [("response_format", "verbose_json"), ("timestamp_granularities[]", "segment"), *auto.items()]
+        words_form = [("response_format", "verbose_json"), ("timestamp_granularities[]", "word"), *auto.items()]
         if "timestamps" not in takes:
             expect_error(transcribe(verbose_form, [("file", name + ".wav", wav)]), 400, "unsupported_parameter", "timestamps",
                          f"{name}: a segment granularity to a model without timestamps")
+            expect_error(transcribe(words_form, [("file", name + ".wav", wav)]), 400, "unsupported_parameter", "timestamps",
+                         f"{name}: a word granularity to a model without timestamps")
             print(f"{name}: json and text give the expected text and stop, and each of its {len(requests)} requests its text, and verbose_json "
                   f"its text and language ({','.join(requests[0][3]) or 'none'}) without segments")
             continue
         status, _, body = transcribe(verbose_form, [("file", name + ".wav", wav)])
         granular = json.loads(body)
         assert status == 200 and granular == plain_verbose, (body, plain_verbose)
+        if "untimed" in granular:
+            assert granular["segments"] == [], body
+            print(f"{name}: json, text and verbose_json give the expected text and stop, verbose_json no segments: {granular['untimed']}")
+            continue
         segments = granular["segments"]
         assert [s["id"] for s in segments] == list(range(len(segments))) and "".join(s["text"] for s in segments) == want, segments
         assert all(set(s) == {"id", "start", "end", "text"} and 0 <= s["start"] <= s["end"] for s in segments), segments
+        # The word granularity alone gives the words without the segments, and both give both.
+        status, _, body = transcribe(words_form, [("file", name + ".wav", wav)])
+        worded = json.loads(body)
+        words = worded["words"]
+        assert status == 200 and set(worded) == set(plain_verbose) - {"segments"} | {"words"}, body
+        assert all(set(w) == {"word", "start", "end"} and w["word"].strip() and 0 <= w["start"] <= w["end"] for w in words), words
+        assert "".join(w["word"] for w in words).replace(" ", "") == want.replace(" ", ""), (words, want)
+        status, _, body = transcribe(verbose_form + [("timestamp_granularities[]", "word")], [("file", name + ".wav", wav)])
+        both = json.loads(body)
+        assert status == 200 and both["segments"] == segments and both["words"] == words, body
         others = f"; each of its {len(requests) - 1} other requests its text" if len(requests) > 1 else ""
         print(f"{name}: json, text and verbose_json give the expected text and stop, verbose_json no language and {len(segments)} segments joining "
-              f"into it, with or without a segment granularity{others}")
+              f"into it, with or without a segment granularity, and {len(words)} words with the word granularity{others}")
+    if not first:
+        raise SystemExit("give a dump of a request without options besides any of speaker tags: the checks after them need its text")
     wav, want, samples = first
     if first:
         # A request's log line gives the status sent, which a range of the answer makes 206.
@@ -404,8 +477,8 @@ else:
                      "a decoding not taken")
     expect_error(transcribe([("temperature", "0")], [("file", "x.wav", wav)]), 400, "unknown_parameter", "temperature", "an unknown member")
     expect_error(transcribe([("response_format", "srt")], [("file", "x.wav", wav)]), 400, "unsupported_value", "response_format", "srt")
-    expect_error(transcribe([("response_format", "verbose_json"), ("timestamp_granularities[]", "word")], [("file", "x.wav", wav)]), 400,
-                 "unsupported_value", "timestamp_granularities[]", "word timestamps")
+    expect_error(transcribe([("response_format", "verbose_json"), ("timestamp_granularities[]", "sentence")], [("file", "x.wav", wav)]), 400,
+                 "unsupported_value", "timestamp_granularities[]", "a granularity speech.cpp does not give")
     expect_error(transcribe([("timestamp_granularities[]", "segment")], [("file", "x.wav", wav)]), 400, "invalid_value",
                  "timestamp_granularities[]", "a granularity without verbose_json")
     expect_error(transcribe([("model", "whisper-1")], [("file", "x.wav", wav)]), 404, "model_not_found", "model", "another model")
@@ -414,47 +487,35 @@ else:
         expect_error(transcribe([("chunking_strategy", "auto")], [("file", "x.wav", wav)]), 400, "unsupported_parameter", "chunking_strategy",
                      "chunking_strategy without a detection model")
     else:
-        # The dumps' audio joined with a second of silence after each, which the detection cuts into regions again; the
-        # server's answers are speech asr --vad's for the same audio and options, which checks/smoke/speech_cli_smoke.py
+        # The server's answers are speech asr --vad's for the same audio and options, which checks/smoke/speech_cli_smoke.py
         # checks against the worker.
-        joined = array.array("f", [x for d in dumps for x in list(read_npy(os.path.join(d, "audio.npy"))) + [0.0] * rate])
-        long, silence = wav_file(joined, rate), wav_file([0.0] * (6 * rate), rate)
-        with tempfile.TemporaryDirectory() as work:
-            path = os.path.join(work, "long.wav")
-            with open(path, "wb") as f:
-                f.write(long)
-            timed = ["--timestamps"] if "timestamps" in takes else []
-
-            def cli(*flags):
-                r = subprocess.run([speech, "asr", model, "--vad", vad, "--format", "json", *timed, *flags, *load, path],
-                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                assert r.returncode == 0, r.stderr.decode()[-600:]
-                return json.loads(r.stdout)
-
-            for form, flags in (([("chunking_strategy", "auto")], []),
-                                ([("chunking_strategy[type]", "server_vad"), ("chunking_strategy[threshold]", "0.6"),
-                                  ("chunking_strategy[prefix_padding_ms]", "200"), ("chunking_strategy[silence_duration_ms]", "700")],
-                                 ["--threshold", "0.6", "--speech-pad-ms", "200", "--min-silence-duration-ms", "700"])):
-                want = cli(*flags)
-                status, headers, body = transcribe(form, [("file", "long.wav", long)])
-                assert status == 200 and json.loads(body) == {"text": want["text"]} and headers["x-speech-stop"] == want["stop"], (form, body)
-                status, _, body = transcribe(form + [("response_format", "verbose_json")], [("file", "long.wav", long)])
-                verbose = json.loads(body)
-                assert verbose["text"] == want["text"] and verbose.get("language") == (",".join(want.get("languages", [])) or None), body
-                if timed:
-                    assert verbose["segments"] == [{"id": i, **s} for i, s in enumerate(want["segments"])], body
-            assert json.loads(transcribe([("chunking_strategy", "auto")], [("file", "silence.wav", silence)])[2]) == {"text": ""}
-            # The detection options given to the server as flags are the defaults of chunking_strategy, before OpenAI's:
-            # a threshold of 1 finds no region, so auto gives an empty text, while a request's own threshold wins.
-            tuned = Server(speech, [model, vad, *options, "--vad.threshold", "1"])
-            listed = json.loads(tuned.call("GET", "/v1/models")[2])["data"]
-            assert [m["defaults"] for m in listed] == [entry["defaults"], detector["defaults"] | {"threshold": 1}], listed
-            status, _, body = tuned.transcribe([("chunking_strategy", "auto")], [("file", "long.wav", long)])
-            assert status == 200 and json.loads(body) == {"text": ""}, body
-            own = [("chunking_strategy[type]", "server_vad"), ("chunking_strategy[threshold]", "0.5")]
-            status, _, body = tuned.transcribe(own, [("file", "long.wav", long)])
-            assert status == 200 and json.loads(body) == {"text": cli()["text"]}, body
-            tuned.stop()
+        silence = wav_file([0.0] * (6 * rate), rate)
+        for form, flags in (([("chunking_strategy", "auto")], []), SERVER_VAD):
+            want = vad_answers[tuple(flags)]
+            status, headers, body = transcribe(form, [("file", "long.wav", long)])
+            assert status == 200 and json.loads(body) == {"text": want["text"]} and headers["x-speech-stop"] == want["stop"], (form, body)
+            status, _, body = transcribe(form + [("response_format", "verbose_json")], [("file", "long.wav", long)])
+            verbose = json.loads(body)
+            assert verbose["text"] == want["text"] and verbose.get("language") == (",".join(want.get("languages", [])) or None), body
+            if timed:
+                assert verbose["segments"] == [{"id": i, **s} for i, s in enumerate(want["segments"])], body
+        assert json.loads(transcribe([("chunking_strategy", "auto")], [("file", "silence.wav", silence)])[2]) == {"text": ""}
+        # The detection options given to the server as flags are the defaults of chunking_strategy, before OpenAI's:
+        # a threshold of 1 finds no region, so auto gives an empty text, while a request's own threshold wins. The server
+        # stops meanwhile, so that the model is held once at a time.
+        out = server.stop()
+        if out:
+            raise SystemExit(f"the server wrote to stdout: {out[:200]!r}")
+        tuned = Server(speech, [model, vad, *options, "--vad.threshold", "1"])
+        listed = json.loads(tuned.call("GET", "/v1/models")[2])["data"]
+        assert [m["defaults"] for m in listed] == [entry["defaults"], detector["defaults"] | {"threshold": 1}], listed
+        status, _, body = tuned.transcribe([("chunking_strategy", "auto")], [("file", "long.wav", long)])
+        assert status == 200 and json.loads(body) == {"text": ""}, body
+        own = [("chunking_strategy[type]", "server_vad"), ("chunking_strategy[threshold]", "0.5")]
+        status, _, body = tuned.transcribe(own, [("file", "long.wav", long)])
+        assert status == 200 and json.loads(body) == {"text": vad_answers[()]["text"]}, body
+        tuned.stop()
+        start_server()
         print(f"chunking_strategy: auto and server_vad give speech asr --vad's text, language{' and segments' if timed else ''} "
               f"for {len(joined) / rate:.1f} s of the dumps joined, and silence an empty text; detection flags given to the "
               f"server are auto's defaults, and a request's own threshold wins")

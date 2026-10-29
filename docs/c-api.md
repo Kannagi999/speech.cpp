@@ -175,7 +175,8 @@ and link `speech.lib`. Inside this CMake project, link the target `speech` (shar
   stopped (`complete`, `max_seconds`, `model_limit` or `cancelled`), the seed of a synthesis, the samples it passed, and
   the regions of a detection as its segments, each with an empty text and no result text, the segments of a
   diarization the same way with each one's speaker (`speech_result_segment_speaker()`), the text of a recognition with
-  its segments and tokens when the request set `timestamps`, and the languages it heard
+  its segments and tokens when the request set `timestamps`, its segments with their speakers when it set `speakers`,
+  or why it has none (`speech_result_untimed()`) where the model cannot time its text, and the languages it heard
   (`speech_result_language_count()`, `speech_result_language()`), none for a model that names none, such as
   FastConformer, and none for a cancelled request. The seed is the request's, or one the library drew
   from 0 to 2^53 - 1, with which the same request repeats its audio on the same device.
@@ -197,8 +198,9 @@ and link `speech.lib`. Inside this CMake project, link the target `speech` (shar
 - A text longer than `speech_model_info_max_text_tokens()` is `out_of_range`, option `text`.
 - Audio shorter than two of the model's mel frames (20 ms for FastConformer) is `out_of_range`, option `audio`. Qwen3-ASR
   pads audio under 0.5 s and takes any.
-- A recognition stops at `model_limit` when it reaches the most tokens the model writes (4096 for Qwen3-ASR), with the
-  text written up to there.
+- A recognition stops at `model_limit` when it reaches the most tokens the model writes (4096 for Qwen3-ASR) or, for
+  Nemotron 3.5 Transcribe, when its text falls into a loop the model's guardrail keeps once, with the text written up to
+  there.
 - Audio that comes out not finite, as from extreme option values, is never passed on: the request ends with
   `out_of_range` naming no option.
 - Nothing is cut short or moved to another device behind the caller's back.
@@ -307,7 +309,7 @@ it concerns (an option's name, `text`, `audio`, `device`, `threads`, `name`, `pa
   may be read from any thread. Separate models are independent.
 - **Versions.** `speech_version()` gives the release the library was built from (`"0.9.1"`). `SPEECH_API_VERSION_MAJOR`
   and `SPEECH_API_VERSION_MINOR`, and `speech_api_version_major()` and `speech_api_version_minor()` for a caller that
-  loads the library at run time, give the API's version, 3.5. The major rises when a declaration changes in a way an
+  loads the library at run time, give the API's version, 3.6. The major rises when a declaration changes in a way an
   existing caller notices, and the minor when a function, an option or an enum value is added. A program built against
   M.m runs against a library of the same major version and a minor version of m or more. The shared library's SOVERSION
   is the major version (`libspeech.3.dylib`, `libspeech.so.3`).
@@ -326,7 +328,7 @@ Each model takes some of them, with ranges and defaults from its file, and `spee
 | `seed` | int | none | Qwen3-TTS, Irodori-TTS, Drama 3 |
 | `speed`, `seconds`, `duration_scale`, `steps` | float, float, float, int | 1, none, 1, none | Irodori-TTS |
 | `max_seconds` | float | none | Qwen3-TTS, Drama 3 (each chunk of a long text) |
-| `timestamps` | bool | false | [FastConformer](models/fastconformer.md#options) |
+| `timestamps` | bool | false | [FastConformer](models/fastconformer.md#options), [Nemotron 3.5 Transcribe](models/nemotron-transcribe.md#options) |
 | `prompt` | string | `""` | [Qwen3-ASR](models/qwen3-asr.md#options), [Nemotron 3.5 Transcribe](models/nemotron-transcribe.md#options) |
 | `draft` | string | `""` | [Qwen3-ASR](models/qwen3-asr.md#options) |
 | `decoding` | string | none | reazonspeech-nemo-v2 |
@@ -340,6 +342,7 @@ Each model takes some of them, with ranges and defaults from its file, and `spee
 | `threshold`, `min_speech_duration_ms`, `min_silence_duration_ms`, `speech_pad_ms`, `max_speech_duration_s` | float, int, int, int, float | none | [Silero VAD](models/silero-vad.md#options) |
 | `streaming_mode`, `spkcache_len`, `fifo_len`, `chunk_len`, `chunk_right_context`, `spkcache_update_period` | string, then int | none | [Sortformer](models/sortformer.md#streaming-modes) |
 | `onset`, `offset`, `pad_onset`, `pad_offset`, `min_duration_on`, `min_duration_off` | float | none | [Sortformer](models/sortformer.md#options) |
+| `speakers` | bool | false | [Nemotron 3.5 Transcribe](models/nemotron-transcribe.md#options) |
 
 - A value at an option's neutral value is accepted by every model. Any other value of an option a model does not take is
   `unsupported`. An option whose neutral value is "none" has none.

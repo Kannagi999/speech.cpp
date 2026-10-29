@@ -14,12 +14,13 @@ const std::string kKeys = "nemotron-transcribe.";
 
 /**
  * What the graphs and the backend allocate while a recognition computes, beyond the weights, the caches and the states:
- * the buffers of the perception module's graphs, a window at a time, and of the language model's at their largest, a
- * block of 512 rows attending to the most positions. For an hour of noise, the longest audio a request takes, with the
- * IQ4_NL file on an Apple M5 they took 627 MiB of Metal's memory, of which 72 MiB grew during the request (2026-10-29);
- * Vulkan's backend takes about 0.3 GB more of its own.
+ * the buffers of the perception module's graphs, a window at a time, of the language model's at their largest, a block
+ * of 512 rows attending to the most positions, and of the CTC head's, a window of the alignment at a time. For an hour of
+ * noise, the longest audio a request takes, with the IQ4_NL file on an Apple M5 the first two took 627 MiB of Metal's
+ * memory, of which 72 MiB grew during the request (2026-10-29), and the head's 127 MiB more, its activations float32
+ * whatever the weights' type (2026-10-30); Vulkan's backend takes about 0.3 GB more of its own.
  */
-constexpr uint64_t kComputeBytes = (uint64_t) 1024 << 20;
+constexpr uint64_t kComputeBytes = (uint64_t) 1152 << 20;
 
 /** Adds the seconds from its construction to its destruction to `total`, when `total` is set. */
 struct Timer {
@@ -42,6 +43,7 @@ Recognizer::Recognizer(const std::string & path, ggml_backend_t backend, const E
       perception_(model_, backend),
       language_model_(model_, backend, 0, -1, experts ? experts->cpu() : nullptr),
       guardrail_(model_),
+      timing_(model_, backend),
       eos_(model_.i32_array(kKeys + "generation.eos_ids")),
       context_length_(model_.size(kKeys + "llm.context_length")),
       max_samples_(model_.size(kKeys + "audio.max_samples")) {
@@ -51,7 +53,7 @@ Recognizer::Recognizer(const std::string & path, ggml_backend_t backend, const E
 }
 
 bool Recognizer::reads(const std::string & name) {
-    return name.rfind("mtp.", 0) != 0 && name.rfind("ctc.", 0) != 0;
+    return name.rfind("mtp.", 0) != 0;
 }
 
 uint64_t Recognizer::working_bytes(const ModelFile & m) {
@@ -68,9 +70,15 @@ uint64_t Recognizer::working_bytes(const ModelFile & m) {
     return keys_values + states + kComputeBytes;
 }
 
-std::pair<std::vector<int32_t>, std::vector<int32_t>> Recognizer::prompt(const std::string & context) const {
+std::pair<std::vector<int32_t>, std::vector<int32_t>> Recognizer::prompt(const RecognitionRequest & request) const {
     const std::string q = kKeys + "prompt.";
-    const std::string text = context.empty() ? model_.str(q + "instruction") : model_.str(q + "context_before") + context + model_.str(q + "context_after");
+    if (request.speakers && !request.context.empty()) {
+        throw Error(Fault::OutOfRange, "a request that asks for speakers takes no prompt: the model card's prompt for speaker tags has no context terms; leave prompt empty",
+                    "prompt");
+    }
+    const std::string text = request.speakers ? model_.str(q + "speakers")
+                             : request.context.empty() ? model_.str(q + "instruction")
+                                                       : model_.str(q + "context_before") + request.context + model_.str(q + "context_after");
     std::vector<int32_t> before = naming("prompt", [&] { return tokenizer_.encode(model_.str(q + "before_text") + text + model_.str(q + "before_audio")); });
     return {std::move(before), tokenizer_.encode(model_.str(q + "after_audio"))};
 }
@@ -85,7 +93,7 @@ std::optional<Recognition> Recognizer::recognize(const std::vector<float> & samp
                         std::to_string(max_samples_ / sample_rate()) + " s, so split it",
                     "audio");
     }
-    const auto [before, after] = prompt(request.context);
+    const auto [before, after] = prompt(request);
     const int64_t frames = perception_.frames(samples.size()), rows = (int64_t) (before.size() + after.size()) + frames;
     if (rows >= context_length_) {
         throw Error(Fault::OutOfRange,
@@ -95,10 +103,13 @@ std::optional<Recognition> Recognizer::recognize(const std::vector<float> & samp
     }
     r.prompt_rows = rows;
 
+    const bool timed = request.speakers || request.timestamps;
+    AlignmentFrames aligned;
     std::vector<float> input;
     {
         Timer t{&r.perception};
-        const std::vector<float> audio = perception_.encode(samples, [&](double done) { return !progress || progress(done / 3); });
+        const std::vector<float> audio =
+            perception_.encode(samples, [&](double done) { return !progress || progress(done / 3); }, nullptr, timed ? &aligned : nullptr);
         if (audio.empty()) return std::nullopt;
         input = language_model_.embed(before);
         input.insert(input.end(), audio.begin(), audio.end());
@@ -126,7 +137,11 @@ std::optional<Recognition> Recognizer::recognize(const std::vector<float> & samp
             const int32_t token = (int32_t) (std::max_element(logits.begin(), logits.end()) - logits.begin());
             r.ids.push_back(token);
             if (std::find(eos_.begin(), eos_.end(), token) != eos_.end()) break;
-            if (language_model_.n_past() >= context_length_) {
+            // A text that has fallen into a loop the guardrail keeps once ends there rather than when the context is full:
+            // on the meeting of reference/nemotron-transcribe's dumps rounded to 16-bit samples, the IQ4_NL file repeats
+            // one sentence after about a hundred tokens, and on an Apple M5 would fill the context in about 30 minutes
+            // (2026-10-30).
+            if (guardrail_.loops(tokenizer_.decode(r.ids)) || language_model_.n_past() >= context_length_) {
                 result.limited = true;
                 break;
             }
@@ -137,6 +152,18 @@ std::optional<Recognition> Recognizer::recognize(const std::vector<float> & samp
     std::vector<int32_t> written = r.ids;
     if (!result.limited) written.pop_back();
     result.text = guardrail_.apply(tokenizer_.decode(written));
+    if (timed) {
+        Timer t{&r.alignment};
+        // The alignment reports no progress of its own, and stops where the decoding's last report would now say stop.
+        const double done = (2 + (double) language_model_.n_past() / (double) context_length_) / 3;
+        std::optional<TimedTranscript> found =
+            timing_.time(result.text, aligned, samples.size(), request.speakers, nullptr, [&] { return !progress || progress(done); });
+        if (!found) return std::nullopt;
+        result.text = std::move(found->text);
+        if (request.timestamps) result.tokens = std::move(found->tokens);
+        result.segments = std::move(found->segments);
+        result.untimed = std::move(found->failure);
+    }
     return result;
 }
 

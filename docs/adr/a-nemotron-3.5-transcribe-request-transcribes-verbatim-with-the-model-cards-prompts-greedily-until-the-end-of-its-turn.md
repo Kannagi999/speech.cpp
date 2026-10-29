@@ -15,10 +15,14 @@ questions, with reasoning for the last. Its official request is a chat completio
 - `mm_processor_kwargs.capture_ctc_timestamps`, which aligns the text to the audio with the checkpoint's CTC head and
   returns word times, speaker segments and the mapping between the two.
 
+The card asks for speaker-attributed transcription with a prompt of its own, which writes `<spk:N>` before each turn.
+
 The server's own settings, MTP or DFlash2 speculative decoding, do not change what greedy decoding writes. The card
 reports its transcriptions after a generation-loop guardrail that collapses a character repeated 21 times or more and a
-block of up to 4096 characters repeated 20 times or more. The model takes 65,536 tokens and recordings up to an hour,
-at 80 ms an audio token.
+block of up to 4096 characters repeated 20 times or more. Greedy decoding does fall into such loops: the IQ4_NL file,
+given the 98 s meeting of the reference dumps as 16-bit samples, writes one sentence over and over from about its
+hundredth token, and would fill the context in about 30 minutes on an Apple M5 (2026-10-30). The model takes 65,536
+tokens and recordings up to an hour, at 80 ms an audio token.
 
 ## Decision
 
@@ -27,27 +31,36 @@ at 80 ms an audio token.
   reasoning off, rendered as the vLLM plugin renders it: the text, one space and the audio locator.
 - **The option `prompt`** is the context terms of the card's contextual transcription: a request with a prompt asks
   "Transcribe with punctuation and capitalization. Context terms: <prompt>." in place of the verbatim prompt.
+- **The option `speakers`** asks with the card's prompt for speaker tags in place of the verbatim prompt
+  ([its record](a-recognition-tells-who-speaks-by-the-option-speakers-whose-segments-carry-the-models-speakers-and-whose-text-drops-its-tags.md)),
+  and **`timestamps`** times the words by the checkpoint's CTC head
+  ([its record](nemotron-3.5-transcribe-times-its-words-by-nemos-ctc-alignment-with-its-defaults-and-fails-where-nemo-drops-words.md)).
 - **`language` is checked, not steering.** The card asks for the language as spoken in every result it reports, and
   never names one.
-- **Greedy decoding until the end of the turn or the context.** No sampling option and no limit of new tokens below
-  the 65,536 the context holds; a request whose text fills it reports so. Recordings longer than an hour, the longest
-  the card's server takes, are refused.
-- **The text keeps the special tokens the model writes**, as the card's request does, and passes through the card's
-  guardrail before it is returned.
+- **Greedy decoding until the end of the turn, a loop or the context.** No sampling option and no limit of new tokens
+  below the 65,536 the context holds. Decoding stops where the text written ends in a run the card's guardrail keeps
+  once, a character 21 times or a block of up to 4096 characters 20 times in a row; a request whose text loops so or
+  fills the context reports `model_limit`. Recordings longer than an hour, the longest the card's server takes, are
+  refused.
+- **The text keeps the special tokens the model writes**, as the card's request does, but the speaker tags of a request
+  that sets speakers, and passes through the card's guardrail before it is returned.
 - **Not offered:** a system turn, an instruction of the caller's own, translation, language identification, answers
-  and reasoning, which are other tasks than recognition; and timestamps, whose alignment the port does not compute
-  yet. The file holds the CTC head and its settings, so that timestamps need no new file.
+  and reasoning, which are other tasks than recognition.
 
 The alternatives were turned down:
 
 - Steering the language by writing it into the prompt ("Language: Japanese."). The card evaluates no such prompt.
 - 16,384 new tokens, the card's example. It cuts a dense recording of more than about 45 minutes.
+- Decoding on through a loop to the end of the context, as vLLM decodes on to its `max_tokens`. The guardrail keeps one
+  copy of the loop, so the rest of the decoding only takes time: half an hour of an Apple M5 for one recording.
+- A limit of new tokens set by the audio's length. A loop still runs on to it, and it must leave room for the densest
+  speech, which the card puts at about 20,000 tokens an hour.
 - The caller's own instruction through the option `instructions`, which only synthesis takes. It would make a
-  recognition's result whatever the instruction asks for, translations and answers included, and the speaker tags it
-  can ask for would want a place in the result of their own.
+  recognition's result whatever the instruction asks for, translations and answers included.
 
 ## Consequences
 
 A request writes what vLLM writes for the card's prompt at temperature 0, but for the guardrail, which only collapses a
-loop the model fell into. Speaker-attributed transcription, translation and timestamps each need a decision of their own
-before a request can ask for them.
+loop the model fell into, and for the loop's end: vLLM writes on, and speech.cpp stops there. A recording in which the
+same words are really said twenty times in a row ends there too. Translation needs a decision of its own before a
+request can ask for it.
