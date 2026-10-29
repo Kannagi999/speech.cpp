@@ -11,7 +11,7 @@ GPU once with each attention. A check whose dumps or inputs are missing is skipp
 A check that exits with 2 refused its arguments, as a check refuses weights it cannot judge; that is reported apart and
 does not fail the run. Any other exit but 0 fails it. Each check's whole output goes to a log of its own in --logs.
 
-families: qwen3-tts, irodori-tts, drama3, qwen3-asr, fastconformer, silero-vad, sortformer, common (the checks that take no
+families: qwen3-tts, irodori-tts, drama3, qwen3-asr, nemotron-transcribe, fastconformer, silero-vad, sortformer, common (the checks that take no
 model), all
 
 usage: python3 checks/run.py <family>... [--build DIR] [--devices cpu,gpu] [--types F32] [--models PATH...]
@@ -30,10 +30,10 @@ import tempfile
 import time
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-FAMILIES = ["qwen3-tts", "irodori-tts", "drama3", "qwen3-asr", "fastconformer", "silero-vad", "sortformer", "common"]
+FAMILIES = ["qwen3-tts", "irodori-tts", "drama3", "qwen3-asr", "nemotron-transcribe", "fastconformer", "silero-vad", "sortformer", "common"]
 # general.file_type's values of the weight types speech.cpp writes, as weight_types() of src/common/storage.cpp lists
 # them; a script cannot read that table.
-FILE_TYPES = {0: "F32", 1: "F16", 7: "Q8_0", 18: "Q6_K", 16: "Q5_K", 14: "Q4_K"}
+FILE_TYPES = {0: "F32", 1: "F16", 7: "Q8_0", 18: "Q6_K", 16: "Q5_K", 14: "Q4_K", 25: "IQ4_NL"}
 REFUSED = 2
 
 SCALARS = {0: "<B", 1: "<b", 2: "<H", 3: "<h", 4: "<I", 5: "<i", 6: "<f", 7: "<?", 10: "<Q", 11: "<q", 12: "<d"}
@@ -160,6 +160,22 @@ def reading(paths, runs):
     names it."""
     absent = [p for p in paths if not os.path.exists(p)]
     return [Run(r.check, [], None, r.what, f"no {absent[0]}") for r in runs] if absent else runs
+
+
+def physical_memory():
+    """The machine's memory in bytes."""
+    if os.name != "nt":
+        return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+    import ctypes
+
+    class MemoryStatus(ctypes.Structure):
+        _fields_ = [("length", ctypes.c_uint32), ("load", ctypes.c_uint32)] + [(n, ctypes.c_uint64) for n in
+                    ("total_physical", "free_physical", "total_paged", "free_paged", "total_virtual", "free_virtual", "free_extended")]
+
+    status = MemoryStatus(length=ctypes.sizeof(MemoryStatus))
+    if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+        raise OSError("GlobalMemoryStatusEx failed")
+    return status.total_physical
 
 
 def named_dumps(check, model, out):
@@ -323,6 +339,35 @@ def qwen3_asr(model, devices, ctx):
     return runs
 
 
+def nemotron_transcribe(model, devices, ctx):
+    out = os.path.join(ctx.reference, "nemotron-transcribe", "out")
+    absent = named_dumps("nemotron-transcribe", model, out)
+    if absent:
+        return [absent]
+    # The tokenizer and the guardrail run on the host.
+    runs = []
+    cases, decode = os.path.join(out, "tokenizer-cases.tsv"), os.path.join(out, "decode-cases.tsv")
+    if os.path.isfile(cases) and os.path.isfile(decode):
+        runs.append(Run("tokenizer-check", [model.path, cases, decode], None, model.label()))
+    else:
+        runs.append(missing("tokenizer-check", model.label(), cases))
+    guardrail = os.path.join(out, "guardrail-cases.tsv")
+    runs += reading([guardrail], [Run("nemotron-transcribe-guardrail-check", [model.path, guardrail], None, model.label())])
+    # The recognition loads the whole file, where the decoder check loads a layer at a time: the F32 file takes about
+    # 136 GB, more than most machines' memory.
+    memory = physical_memory()
+    for device in devices:
+        runs += [runs_on(device, f"nemotron-transcribe-{stage}-check", model, [out]) for stage in ("encoder", "speakers", "perception", "decoder")]
+        # On a GPU, the language model again with its experts on the CPU, as a GPU that does not hold them runs it.
+        if device != "cpu":
+            runs.append(Run("nemotron-transcribe-decoder-check", [model.path, out, device, "experts-on-cpu"], device, f"{model.label()} {device} experts-on-cpu"))
+        recognizer = runs_on(device, "nemotron-transcribe-recognizer-check", model, [out])
+        if os.path.getsize(model.path) > memory:
+            recognizer.skip = f"the file takes more than the machine's {memory / 2**30:.0f} GiB of memory"
+        runs.append(recognizer)
+    return runs
+
+
 def fastconformer(model, devices, ctx):
     out = os.path.join(ctx.reference, "fastconformer", "out")
     absent = named_dumps("fastconformer", model, out)
@@ -362,8 +407,8 @@ def common(ctx):
     return runs
 
 
-PLANS = {"qwen3-tts": qwen3_tts, "irodori-tts": irodori_tts, "drama3": drama3, "qwen3-asr": qwen3_asr, "fastconformer": fastconformer, "silero-vad": silero_vad,
-         "sortformer": sortformer}
+PLANS = {"qwen3-tts": qwen3_tts, "irodori-tts": irodori_tts, "drama3": drama3, "qwen3-asr": qwen3_asr, "nemotron-transcribe": nemotron_transcribe,
+         "fastconformer": fastconformer, "silero-vad": silero_vad, "sortformer": sortformer}
 
 
 def executable(build, check):

@@ -38,6 +38,9 @@ args = args[:args.index("--")] if "--" in args else args
 speech, model, *dumps = args
 if not dumps:
     raise SystemExit(__doc__)
+# The texts of a quantized file come from `speech asr`, which loads the model again: before the worker holds it, so that
+# a model of half the GPU's memory needs only its own.
+requests = {d: dump_requests(speech, model, d, flags) for d in dumps}
 w = Worker(speech, model, flags)
 info = w.ready["model"]
 defaults = w.ready["defaults"]
@@ -82,12 +85,12 @@ audio, want_text, want_langs = {}, {}, {}
 for d in dumps:
     name = os.path.basename(os.path.normpath(d))
     audio[name] = pcm16(read_npy(os.path.join(d, "audio.npy")))
-    for request, members, want, want_languages in dump_requests(speech, model, d, flags):
+    for request, members, want, want_languages in requests[d]:
         # A language the model only checks is sent too, which must change nothing.
         if request == "auto":
             want_text[name], want_langs[name] = want, want_languages
             if not options["language"]["steers"]:
-                members = {"language": info["languages"][0]}
+                members = {**members, "language": info["languages"][0]}
         id = f"{name}/{request}"
         t1 = time.perf_counter()
         send_audio(id, audio[name], **members, **timed)
@@ -135,7 +138,12 @@ for i in range(max(len(a), len(b))):
         w.send(x)
 w.send({"type": "transcribe", "id": "b", "sample_rate": rate})
 w.send({"type": "transcribe", "id": "a", "sample_rate": rate})
-got = [w.read(), w.read()]
+# A recognition that runs for more than two seconds, as on a GPU that leaves experts to the CPU, also reports progress.
+got = []
+while len(got) < 2:
+    m = w.read()
+    if m["type"] != "progress":
+        got.append(m)
 assert [(m["type"], m["id"]) for m in got] == [("end", "b"), ("end", "a")] and got[0]["text"] == got[1]["text"], [short(m) for m in got]
 print("interleaved chunks: answered in the order of the transcribes")
 

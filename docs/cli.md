@@ -341,14 +341,14 @@ The table below is what a pipe or a file gets. On a terminal the list groups the
 with a check, and gives a model's languages once, on its own type's row, cut to the terminal's width.
 
 ```
-NAME                           TYPE  SIZE     FETCHED  TASK         LANGUAGES
-qwen3-tts-0.6b                 q8_0  1.21 GB  no       synthesis    de en es fr it ja ko pt ru zh
-qwen3-tts-0.6b:q6_k            q6_k  0.99 GB  no       synthesis    de en es fr it ja ko pt ru zh
-qwen3-tts-0.6b:q5_k            q5_k  0.87 GB  no       synthesis    de en es fr it ja ko pt ru zh
-qwen3-tts-0.6b:q4_k            q4_k  0.76 GB  no       synthesis    de en es fr it ja ko pt ru zh
+NAME                           TYPE    SIZE     FETCHED  TASK         LANGUAGES
+qwen3-tts-0.6b                 q8_0    1.21 GB  no       synthesis    de en es fr it ja ko pt ru zh
+qwen3-tts-0.6b:q6_k            q6_k    0.99 GB  no       synthesis    de en es fr it ja ko pt ru zh
+qwen3-tts-0.6b:q5_k            q5_k    0.87 GB  no       synthesis    de en es fr it ja ko pt ru zh
+qwen3-tts-0.6b:q4_k            q4_k    0.76 GB  no       synthesis    de en es fr it ja ko pt ru zh
 ...
-reazonspeech-v2                q8_0  0.66 GB  no       recognition  ja
-reazonspeech-v2:f16            f16   1.24 GB  no       recognition  ja
+reazonspeech-v2                q8_0    0.66 GB  no       recognition  ja
+reazonspeech-v2:f16            f16     1.24 GB  no       recognition  ja
 ...
 
 The model to start with for each language:
@@ -400,11 +400,12 @@ in the folder is refused with exit 1, before anything is removed.
 ## speech quantize
 
 ```
-speech quantize MODEL OUT --type f16|q8_0|q6_k|q5_k|q4_k
+speech quantize MODEL OUT --type f16|q8_0|q6_k|q5_k|q4_k|iq4_nl
 ```
 
 - Writes MODEL, a model file of F32 weights, in another weight type, on the CPU. Some tensors stay in a wider type, as
   each family needs. A file in another type is refused, and so is Silero VAD's, which is F32 alone.
+- Nemotron 3.5 Transcribe takes `f16`, `q8_0` and `iq4_nl`, and every other model every type but `iq4_nl`.
 - OUT is the file to write, or a folder, in which the file takes its usual name, such as `Qwen3-ASR-0.6B-Q4_K.gguf`.
 - The F32 file comes from the official checkpoint through the model's converter, in a clone of this repository with
   [uv](https://docs.astral.sh/uv/):
@@ -414,8 +415,8 @@ speech quantize MODEL OUT --type f16|q8_0|q6_k|q5_k|q4_k
   speech quantize ../../models/Qwen3-ASR-0.6B-F32.gguf ../../models --type q4_k
   ```
 
-  The other converters are `reference/qwen3-tts/convert.py 0.6b|1.7b`, `reference/irodori-tts/convert.py mf|rf` and
-  `reference/fastconformer/convert.py <model name>`.
+  The other converters are `reference/qwen3-tts/convert.py 0.6b|1.7b`, `reference/irodori-tts/convert.py mf|rf`,
+  `reference/fastconformer/convert.py <model name>` and `reference/nemotron-transcribe/convert.py`.
 
 `q6_k`, `q5_k` and `q4_k` make smaller files that compute less exactly. In the stage checks against the official
 implementation:
