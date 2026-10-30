@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -183,9 +184,9 @@ size_t Synthesizer::synthesize(const Request & r, const Voice & voice, const Aud
         // The runtime runs the duration predictor only when no length is fixed.
         ggml_tensor * sum = nullptr;
         if (!r.length.fixed()) {
-            // The speaker's summary is its condition's first token, or the learned null speaker without a reference.
-            ggml_tensor * summary = reference ? g.input(std::vector<float>(voice.speaker.begin(), voice.speaker.begin() + speaker_.dim()), speaker_.dim())
-                                              : model_->tensor("duration.null_speaker");
+            // This isolated experiment keeps the reference in sampling and predicts length with the learned null speaker.
+            if (!has_null_speaker()) throw std::logic_error("the null-duration experiment requires the learned null speaker");
+            ggml_tensor * summary = model_->tensor("duration.null_speaker");
             sum = duration_.build(g, state, summary, caption_condition);
             g.output(sum);
         }
@@ -196,6 +197,8 @@ size_t Synthesizer::synthesize(const Request & r, const Voice & voice, const Aud
     }
     const Length length = duration_.length(r.length, predicted);
     const int frames = length.frames;
+    std::fprintf(stderr, "null-duration-experiment: summary=duration.null_speaker predicted=%g frames=%d samples=%lld speaker_tokens=%d fixed=%d keep_tail=%d\n",
+                 predicted, frames, (long long) length.samples, voice.speaker_tokens, r.length.fixed(), tail.keep);
     std::vector<float> x;
     {
         Timer t{st.sampling};

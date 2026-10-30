@@ -1,0 +1,55 @@
+name: windows-null-duration
+
+# The Windows x64 Vulkan build of 0.8.3 with the null-speaker duration patch, as the official windows-vulkan job
+# builds it. OpenMP is off so the program needs no Visual C++ Redistributable.
+on:
+  push:
+    branches: [v0.8.3-null-duration]
+  workflow_dispatch:
+
+jobs:
+  windows-vulkan:
+    runs-on: windows-2025
+    env:
+      VULKAN_VERSION: 1.4.357.0
+      CMAKE_OPTIONS: -A x64 -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded
+      GGML_OPTIONS: -DGGML_VULKAN=ON -DGGML_NATIVE=OFF -DGGML_OPENMP=OFF -DBUILD_SHARED_LIBS=OFF -DGGML_BUILD_TESTS=OFF -DGGML_BUILD_EXAMPLES=OFF
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install the Vulkan SDK
+        run: |
+          curl.exe -o $env:RUNNER_TEMP/VulkanSDK-Installer.exe -L "https://sdk.lunarg.com/sdk/download/${env:VULKAN_VERSION}/windows/vulkansdk-windows-X64-${env:VULKAN_VERSION}.exe"
+          & "$env:RUNNER_TEMP\VulkanSDK-Installer.exe" --accept-licenses --default-answer --confirm-command install
+          Add-Content $env:GITHUB_ENV "VULKAN_SDK=C:\VulkanSDK\${env:VULKAN_VERSION}"
+          Add-Content $env:GITHUB_PATH "C:\VulkanSDK\${env:VULKAN_VERSION}\bin"
+      - name: Build ggml
+        run: |
+          git submodule update --init --depth 1 ggml
+          $options = "$env:CMAKE_OPTIONS $env:GGML_OPTIONS" -split ' '
+          cmake -S ggml -B ggml-build @options "-DCMAKE_INSTALL_PREFIX=$PWD/ggml-install"
+          cmake --build ggml-build --config Release -j 4
+          cmake --install ggml-build --config Release
+      - name: Build
+        run: |
+          $options = $env:CMAKE_OPTIONS -split ' '
+          cmake -B build @options -DSPEECH_INSTALLED_GGML=ON "-DCMAKE_PREFIX_PATH=$PWD/ggml-install"
+          cmake --build build --config Release -j 4
+      - name: Package
+        run: |
+          $archive = "speech-$((Get-Content VERSION -TotalCount 1).Trim())-null-duration-windows-x64-vulkan.zip"
+          New-Item -ItemType Directory package
+          Copy-Item build/Release/speech.exe, build/Release/speech.dll package/
+          Compress-Archive -Path package/* -DestinationPath $archive
+          Add-Content $env:GITHUB_ENV "ARCHIVE=$archive"
+      # Only Windows itself, the Vulkan loader the GPU driver installs and speech.dll may be loaded.
+      - name: Check what the programs load
+        shell: cmd
+        continue-on-error: true
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat" >nul 2>&1 || call "C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Auxiliary\Build\vcvars64.bat" >nul
+          dumpbin /dependents package\speech.exe package\speech.dll
+      - uses: actions/upload-artifact@v4
+        with:
+          name: speech-null-duration-windows-x64-vulkan
+          path: ${{ env.ARCHIVE }}
+          retention-days: 7
